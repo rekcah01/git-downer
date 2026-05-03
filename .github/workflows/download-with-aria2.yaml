@@ -1,0 +1,132 @@
+name: Download from Commit & Save to Repo
+
+on:
+  push:
+    branches:
+      - "**"
+
+jobs:
+  save-file:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install aria2 and zip
+        run: sudo apt-get install -y aria2 zip wget
+
+      - name: Extract URLs and download files
+        run: |
+          set -euo pipefail
+
+          download_file() {
+            local URL="$1"
+            local DEST="tmp_downloads"
+
+            echo "⬇️ Trying aria2c: $URL"
+            if aria2c \
+                --split=4 \
+                --max-connection-per-server=4 \
+                --min-split-size=20M \
+                --max-tries=5 \
+                --retry-wait=10 \
+                --dir="$DEST" \
+                "$URL"; then
+              echo "✅ aria2c succeeded: $URL"
+              return 0
+            fi
+
+            echo "⚠️ aria2c failed — falling back to wget: $URL"
+            if wget \
+                --tries=5 \
+                --waitretry=10 \
+                --timeout=60 \
+                --continue \
+                --show-progress \
+                -P "$DEST" \
+                "$URL"; then
+              echo "✅ wget succeeded: $URL"
+              return 0
+            fi
+
+            echo "❌ Both aria2c and wget failed for: $URL"
+            return 1
+          }
+
+          MSG=$(git log -1 --pretty=%B)
+          echo "Commit message: $MSG"
+
+          if echo "$MSG" | grep -qP 'download-zip:'; then
+            MODE="zip"
+            URL_LINE=$(echo "$MSG" | grep -oP 'download-zip:\s*\K.*')
+          elif echo "$MSG" | grep -qP 'download:'; then
+            MODE="normal"
+            URL_LINE=$(echo "$MSG" | grep -oP 'download:\s*\K.*')
+          else
+            echo "❌ No download command found in commit message"
+            exit 1
+          fi
+
+          echo "Mode: $MODE"
+          mkdir -p downloads tmp_downloads
+
+          readarray -t URLS <<< "$(echo "$URL_LINE" | tr ' ' '\n' | grep -v '^$')"
+
+          for URL in "${URLS[@]}"; do
+            download_file "$URL" || exit 1
+          done
+
+          LIMIT=$((90 * 1024 * 1024))
+
+          if [ "$MODE" = "zip" ]; then
+            ARCHIVE_NAME="archive_$(date +%Y%m%d_%H%M%S).zip"
+            mapfile -t DL_FILES < <(find tmp_downloads -maxdepth 1 -type f)
+            if [ ${#DL_FILES[@]} -eq 0 ]; then
+              echo "❌ No files downloaded"
+              exit 1
+            fi
+            zip -j "tmp_downloads/$ARCHIVE_NAME" "${DL_FILES[@]}"
+            for F in "${DL_FILES[@]}"; do rm -f "$F"; done
+          fi
+
+          shopt -s nullglob
+          for FILE in tmp_downloads/*; do
+            [ -f "$FILE" ] || continue
+            SIZE=$(stat -c%s "$FILE")
+            BASENAME=$(basename "$FILE")
+
+            if [ "$SIZE" -gt "$LIMIT" ]; then
+              echo "✂️ $BASENAME is $(( SIZE / 1024 / 1024 ))MB — splitting..."
+              zip -s 90m "downloads/${BASENAME}.zip" -j "$FILE"
+              PART_COUNT=$(ls downloads/${BASENAME}* 2>/dev/null | wc -l)
+              echo "✅ Split into $PART_COUNT parts"
+            else
+              cp "$FILE" "downloads/$BASENAME"
+              echo "✅ Copied: $BASENAME ($(( SIZE / 1024 / 1024 ))MB)"
+            fi
+          done
+
+          rm -rf tmp_downloads
+
+      - name: Commit & Push
+        run: |
+          set -euo pipefail
+
+          BRANCH="${GITHUB_REF_NAME}"
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add downloads/
+
+          if git diff --cached --quiet; then
+            echo "⚠️ Nothing to commit"
+            exit 0
+          fi
+
+          git commit -m "Add downloaded files [skip ci]"
+          echo "🚀 Pushing to branch: $BRANCH"
+          git push origin "HEAD:$BRANCH"
